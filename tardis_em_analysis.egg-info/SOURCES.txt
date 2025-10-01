@@ -21,3 +21,6 @@ tardis_em_analysis.egg-info/top_level.txt
 tardis_em_analysis/mt_classification/__init__.py
 tardis_em_analysis/mt_classification/mt_classes.py
 tardis_em_analysis/mt_classification/utils.py
+tardis_em_analysis/stitch_volume/__init__.py
+tardis_em_analysis/stitch_volume/align_tomograms.py
+tardis_em_analysis/stitch_volume/utils.py

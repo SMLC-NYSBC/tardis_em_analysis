@@ -1,10 +1,10 @@
 Metadata-Version: 2.4
 Name: tardis_em_analysis
-Version: 0.3.19
+Version: 0.3.20
 Summary: Collection of analysis libraries used by TARDIS-EM and napari-tardis-em.
-Home-page: https://github.com/SMLC-NYSBC/tardis-analysis
+Home-page: https://github.com/SMLC-NYSBC/tardis_em_analysis
 Author: Robert Kiewisz, Tristan Bepler
-Author-email: robert.kiewisz@gmail.com, rkiewisz@nysbc.org, tbepler@nysbc.org
+Author-email: robert.kiewisz@gmail.com
 License: MIT
 Keywords: tardis-em,analysis,filaments,membranes
 Classifier: Development Status :: 5 - Production/Stable
@@ -25,6 +25,7 @@ Requires-Dist: imagecodecs
 Requires-Dist: scikit-learn>1.0.1
 Requires-Dist: scikit-image>0.19.2
 Requires-Dist: scipy>=1.10.0
+Requires-Dist: opencv-python>=4.12.0.0
 Requires-Dist: ipython>8.10.0
 Requires-Dist: setuptools>=67.6.0
 Dynamic: license-file
