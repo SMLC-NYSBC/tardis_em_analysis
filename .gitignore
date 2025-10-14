@@ -2,3 +2,5 @@
 .DS_Store
 /dist
 *.pyc
+/.idea
+.DS_Store

@@ -288,7 +288,8 @@ def analyse_filaments_list(
         assert_i = len(data) == len(images)
     else:
         assert_i = len(data) > 0
-    assert not assert_i, "List of analysed files do not match or is 0"
+
+    assert assert_i, "List of analysed files do not match or is 0"
 
     if images is None:
         images = [None for _ in range(len(data))]
