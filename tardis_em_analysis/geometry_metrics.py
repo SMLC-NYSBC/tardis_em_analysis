@@ -12,6 +12,7 @@ from typing import Union
 import numpy as np
 from scipy.interpolate import splev, splprep
 from scipy.spatial.distance import pdist
+from scipy.ndimage import gaussian_filter1d
 from sklearn.cluster import DBSCAN
 
 
@@ -257,24 +258,22 @@ def angle_between_vectors(v1: np.ndarray, v2: np.ndarray) -> float:
     return np.degrees(angle)
 
 
-def intensity(data: np.ndarray, image: np.ndarray, thickness=1) -> tuple:
+def intensity(data: np.ndarray, image: np.ndarray, thickness=(1, 1)) -> tuple:
     """
     Computes the intensity values along a parametric spline through a given dataset and subtracts
     the background intensity estimated from parallel shifted spline paths. This function is designed
     specifically for tasks involving intensity extraction in image processing.
 
-    :param data: 2D array containing the coordinates corresponding to the data points the spline
-                 is fitted to.
+    :param data: 2D/3D array containing the coordinates corresponding to the data points the spline
+                 is fitted to (x, y, z; z ignored for 2D images).
     :type data: np.ndarray
-    :param image: 2D image array from which pixel intensity values will be extracted.
+    :param image: 2D/3D image array from which pixel intensity values will be extracted.
     :type image: np.ndarray
-    :param thickness: Integer denoting the thickness of the line for which pixel intensities will
-                      be aggregated. Default value is 1.
-    :type thickness: int, optional
+    :param thickness: Tuple (foreground_thickness, background_thickness). Default (1, 1).
+    :type thickness: tuple[int, int]
 
-    :return: 1D array containing the adjusted intensity values along the spline after background
-             subtraction.
-    :rtype: np.ndarray
+    :return: Tuple (mean_intensity, sum_intensity) after background subtraction.
+    :rtype: tuple[float, float]
     """
     tck, u = splprep(data.T, s=None)
 
@@ -284,42 +283,31 @@ def intensity(data: np.ndarray, image: np.ndarray, thickness=1) -> tuple:
     pixel_coords = np.rint(data_fine).astype(int)
     pixel_coords = np.unique(pixel_coords, axis=0)
 
-    if thickness[1] > 1:
-        pixel_coords_bg = np.copy(thicken_line_coordinates(pixel_coords, thickness[1]))
-    else:
-        pixel_coords_bg = np.copy(pixel_coords)
-
     if thickness[0] > 1:
         pixel_coords = np.copy(thicken_line_coordinates(pixel_coords, thickness[0]))
 
     # Extract the pixel values along the spline
     spline_intensity = pixel_intensity(pixel_coords, image)
-
-    # Determined avg. background level
-    spline_up = np.copy(pixel_coords_bg)
-    spline_up[:, 1] = spline_up[:, 1] + (thickness[1] * 2)
-
-    spline_down = np.copy(pixel_coords_bg)
-    spline_down[:, 1] = spline_down[:, 1] - (thickness[1] * 2)
-
-    # Extract the pixel values along the spline
-    intensity_up = pixel_intensity(spline_up, image)
-    intensity_down = pixel_intensity(spline_down, image)
-
-    if intensity_up is None and intensity_down is not None:
-        spline_background = intensity_down
-    elif intensity_down is None and intensity_up is not None:
-        spline_background = intensity_up
-    elif intensity_up is not None and intensity_down is not None:
-        if np.mean(intensity_up) > np.mean(intensity_down):
-            spline_background = np.mean(intensity_down)
-        else:
-            spline_background = np.mean(intensity_up)
-    else:
+    if spline_intensity is None:
         return 0.0, 0.0
 
-    m = np.mean(np.array(spline_intensity) - spline_background)
-    s = np.sum(np.array(spline_intensity) - spline_background)
+    # Local BG: 5px band around spline pixels, outlier-removed mean
+    band_radius = 5
+    bg_pixels = thicken_line_coordinates(pixel_coords, band_radius)
+    bg_intensities = pixel_intensity(bg_pixels, image)
+    if bg_intensities is None or len(bg_intensities) == 0:
+        spline_background = 0.0
+    else:
+        bg_array = np.array(bg_intensities)
+        q1, q3 = np.percentile(bg_array, [25, 75])
+        iqr = q3 - q1
+        mask = (bg_array >= q1 - 1.5 * iqr) & (bg_array <= q3 + 1.5 * iqr)
+        clean_bg = bg_array[mask]
+        spline_background = np.mean(clean_bg)
+
+    spline_intensity_array = np.array(spline_intensity)
+    m = np.mean(spline_intensity_array - spline_background)
+    s = np.sum(spline_intensity_array - spline_background)
 
     return m, s
 
@@ -411,28 +399,19 @@ def thicken_line_coordinates(coords: np.ndarray, thickness: int):
 
 
 def intensity_list(
-    coord: np.ndarray, image: np.ndarray, thickness=1, normalize_image=False
+    coord: np.ndarray, image: np.ndarray, thickness=(1, 1), normalize_image=False
 ):
     """
-    Extracts intensity values along spline coordinates from the given image.
+    Extracts mean/sum intensity values along grouped spline coordinates from the given image.
 
-    This function computes the intensity values along a set of spline coordinates
-    within a given image, using the specified thickness for sampling. It iterates
-    through unique spline identifiers in the coordinate array, processes points
-    associated with each identifier, and computes the intensity or returns a zero
-    value if there are insufficient points.
+    Computes background-subtracted intensities for each unique spline ID (first column of coord).
 
-    :param coord: A 2D array containing the spline coordinates. The first column
-        represents unique identifiers for each spline, and the remaining columns
-        represent the spatial coordinates of each point.
-    :param image: A 2D numpy array representing the image from which intensity
-        values are to be extracted.
-    :param thickness: An optional parameter specifying the thickness used for
-        sampling intensity values. Defaults to 1.
+    :param coord: (N, 4) array: [spline_id, x, y, z]; z ignored for 2D images.
+    :param image: 2D/3D numpy array.
+    :param thickness: Tuple (fg_thick, bg_thick).
+    :param normalize_image: Normalize image to [0,1] first.
 
-    :return: A list of intensity values computed for each unique spline identifier.
-        The list contains a computed intensity value for identifiers with sufficient
-        points and 0.0 for those with insufficient points.
+    :return: Lists (means, sums) for each spline.
     """
     spline_intensity_list_m, spline_intensity_list_s = [], []
     if normalize_image:
@@ -487,24 +466,23 @@ def calculate_spline_correlations(
         spline_up = np.copy(pixel_coords_bg)
         spline_up[:, 1] = spline_up[:, 1] + thickness[1]
 
-        spline_down = np.copy(pixel_coords_bg)
-        spline_down[:, 1] = spline_down[:, 1] - thickness[1]
+        ref_intensity_raw = pixel_intensity(pixel_coords, frame_ref)
 
-        # Extract the pixel values along the spline
+        # Determine avg. background level (lowest mean from shifted lines)
+        spline_up = np.copy(pixel_coords_bg)
+        spline_up[:, 1] += thickness[1] + 10  # Note: +10 for extra shift
+        spline_down = np.copy(pixel_coords_bg)
+        spline_down[:, 1] -= thickness[1] + 10
+
         intensity_up = pixel_intensity(spline_up, frame_ref)
         intensity_down = pixel_intensity(spline_down, frame_ref)
 
-        if intensity_up is None and intensity_down is not None:
-            spline_background = intensity_down
-        elif intensity_down is None and intensity_up is not None:
-            spline_background = intensity_up
-        elif intensity_up is not None and intensity_down is not None:
-            if np.mean(intensity_up) > np.mean(intensity_down):
-                spline_background = np.mean(intensity_down)
-            else:
-                spline_background = np.mean(intensity_up)
-        else:
-            spline_background = 0.0
+        bg_means = []
+        if intensity_up is not None and len(intensity_up) > 0:
+            bg_means.append(np.mean(intensity_up))
+        if intensity_down is not None and len(intensity_down) > 0:
+            bg_means.append(np.mean(intensity_down))
+        spline_background = min(bg_means) if bg_means else 0.0
 
         def is_floatable(x):
             try:

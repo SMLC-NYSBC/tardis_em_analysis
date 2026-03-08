@@ -4,3 +4,6 @@
 *.pyc
 /.idea
 .DS_Store
+.DS_Store
+.vscode/settings.json
+/tardis_em_analysis.egg-info
