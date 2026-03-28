@@ -13,6 +13,7 @@ from os import mkdir
 from os.path import isdir, split, splitext, join
 from typing import Union
 import cv2
+from sklearn.cluster import KMeans
 
 import numpy as np
 import tifffile.tifffile as tiff
@@ -22,7 +23,7 @@ from scipy.signal import correlate2d
 from scipy.stats import entropy
 
 from tardis_em_analysis import version
-from tardis_em.stitch_volume.utils import sort_tomogram_files
+from tardis_em_analysis.stitch_volume.utils import sort_tomogram_files
 from tardis_em.utils.export_data import to_am, to_mrc, NumpyToAmira
 from tardis_em.utils.load_data import load_image, ImportDataFromAmira
 from tardis_em.utils.logo import print_progress_bar, TardisLogo
@@ -38,7 +39,7 @@ class AlignTomograms:
         self.output_path = output_path
         self.method = method.lower()
 
-        assert method in ['sift', 'warp', 'powell'], f'Method must be one of ["sift", "powell"], but got {method}'
+        assert method in ['sift', 'warp', 'powell', 'akaze'], f'Method must be one of ["sift", "powell", "akaze"], but got {method}'
         assert len(self.images_path) == len(self.coords_path), \
             (f'Image and coord path must have same length! '
              f'But images {len(self.images_path)} != coors {len(self.coords_path)}')
@@ -372,7 +373,7 @@ class VolumeRidgeRegistration:
             log_=False,
     ):
         method = method.lower()
-        assert method in ['sift', 'warp', 'powell'], f'Method must be one of ["sift", "powell"], but got {method}'
+        assert method in ['sift', 'warp', 'powell', 'akaze'], f'Method must be one of ["sift", "powell", "akaze"], but got {method}'
         self.mean_std = MeanStdNormalize()
         self.normalize = RescaleNormalize(clip_range=(.1, 99.9))
 
@@ -388,8 +389,9 @@ class VolumeRidgeRegistration:
         self.log_ = log_
 
     def volume_to_projection(self, img1, img2, original_=False, transform_fixed=None):
-        im1_pos = int(img1.shape[0] * 0.05)
-        im2_pos = int(img2.shape[0] * 0.05)
+        im1_pos, im2_pos = 10, 10
+        # im1_pos = int(img1.shape[0] * 0.05)
+        # im2_pos = int(img2.shape[0] * 0.05)
 
         img1 = np.sum(img1[-im1_pos:, ...], axis=0)
         img1 = zoom(img1, 1 / self.down_scale)
@@ -708,10 +710,17 @@ class VolumeRidgeRegistration:
             self.mask_moving = np.clip(self.mask_moving, 0, 1).astype(np.uint8)
 
             self.Angle, self.Tx, self.Ty, self.Scale = self.align_images_sift(fixed_img, moving_img)
+        if self.method == "akaze":
+            fixed_img = np.clip(fixed_img * 255.0, 0, 255).astype(np.uint8)
+            self.mask_fix = np.clip(self.mask_fix, 0, 1).astype(np.uint8)
+            moving_img = np.clip(moving_img * 255.0, 0, 255).astype(np.uint8)
+            self.mask_moving = np.clip(self.mask_moving, 0, 1).astype(np.uint8)
+
+            self.Angle, self.Tx, self.Ty, self.Scale = self.align_images_akaze(fixed_img, moving_img)
         if self.method == "warp":
             self.Angle, self.Tx, self.Ty, self.Scale = self.align_images_warp(fixed_img, moving_img)
 
-        if (self.Angle == 0 and self.Tx == 0 and self.Ty == 0 and self.Scale == 1) or self.method == 'powell':
+        if self.method == 'powell':
             # Initial guess: no rotation, no translation
             initial_params = [self.Angle, self.Tx, self.Ty, self.Scale]  # [angle, tx, ty, Scale]
 
@@ -731,7 +740,6 @@ class VolumeRidgeRegistration:
                 (0.9, 1.1) if "s" in self.ridge_operation else (1.0, 1.0),
             ]
 
-            np.random.seed(42)
             result = optimize.minimize(
                 self.find_best_ridge_transformation,
                 initial_params,
@@ -783,12 +791,66 @@ class VolumeRidgeRegistration:
 
         return angle, tx, ty, 1.0
 
-    def align_images_warp(self, reference: np.ndarray, moving: np.ndarray, max_iter=5000, epsilon=1e-5):
-        warp_mode = cv2.MOTION_HOMOGRAPHY
-        warp_matrix = np.zeros((3, 3), dtype=np.float32)
+    def align_images_akaze(self, reference: np.ndarray, moving: np.ndarray, max_features=500, good_match_ratio=0.75):
+        # Detect AKAZE features and descriptors
+        akaze = cv2.AKAZE_create()
+        kp_ref, des_ref = akaze.detectAndCompute(reference, self.mask_fix)
+        kp_mov, des_mov = akaze.detectAndCompute(moving, self.mask_moving)
 
+        # Match features using BFMatcher with Hamming distance
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        raw_matches = matcher.knnMatch(des_mov, des_ref, k=2)  # Query: moving, Train: reference
+
+        # Apply ratio test for good matches
+        good_matches = []
+        for m, n in raw_matches:
+            if m.distance < good_match_ratio * n.distance:
+                good_matches.append(m)
+
+        # Sort by distance and limit if needed
+        good_matches = sorted(good_matches, key=lambda x: x.distance)[:max_features]
+
+        if len(good_matches) < 4:  # Need at least 4 for similarity
+            return 0, 0, 0, 1
+
+        # Extract points
+        pts_mov = np.float32([kp_mov[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        pts_ref = np.float32([kp_ref[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+        # Estimate similarity transformation (rotation, translation, scale) with RANSAC
+        matrix, _ = cv2.estimateAffinePartial2D(pts_mov, pts_ref, method=cv2.RANSAC)
+
+        if matrix is None:
+            return 0, 0, 0, 1
+
+        scale = np.sqrt(matrix[0, 0] ** 2 + matrix[0, 1] ** 2)
+        angle = np.arctan2(matrix[0, 1], matrix[0, 0]) * 180 / np.pi
+        tx, ty = matrix[0, 2], matrix[1, 2]
+
+        return angle, tx, ty, 1.0
+
+    def align_images_warp(self, reference: np.ndarray, moving: np.ndarray, max_iter=1000, epsilon=1e-4):
+        # warp_mode = cv2.MOTION_HOMOGRAPHY
+        # warp_matrix = np.eye(3, dtype=np.float32)
+        warp_mode = cv2.MOTION_EUCLIDEAN     # or even MOTION_EUCLIDEAN for start
+        warp_matrix = np.eye(2, 3, dtype=np.float32)   # 2×3
+
+        
         criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, max_iter, epsilon)
-        cc, warp_matrix = cv2.findTransformECC(reference, moving, warp_matrix, warp_mode, criteria, self.mask_fix)
+
+        def normalize_for_ecc(img):
+            img = img.astype(np.float32)
+            img -= np.mean(img)
+            img /= (np.std(img) + 1e-8)          # avoid div-by-zero
+            return img
+
+        reference_norm = normalize_for_ecc(reference)
+        moving_norm    = normalize_for_ecc(moving)
+
+        _, warp_matrix = cv2.findTransformECC(reference_norm, moving_norm, warp_matrix, warp_mode, criteria, self.mask_moving)
+
+        if np.isnan(warp_matrix).any():
+            return 0.0, 0.0, 0.0, 1.0
 
         angle = np.arctan2(warp_matrix[0, 1], warp_matrix[0, 0]) * 180 / np.pi
         tx, ty = warp_matrix[0, 2], warp_matrix[1, 2]
@@ -819,7 +881,7 @@ class VolumeRidgeRegistration:
             moving_coord[:, 1] = moving_coord[:, 1] + pad_H[0]
             moving_coord[:, 2] = moving_coord[:, 2] + pad_W[0]
 
-        M = self.compute_transformation_matrix(cy, cx, self.Angle, 1.)
+        M = self.compute_transformation_matrix(cy, cx, self.Angle, self.Scale)
         M = np.linalg.inv(M)
 
         coords = np.ones((moving_coord.shape[0], 3))
@@ -868,5 +930,164 @@ class VolumeRidgeRegistration:
             return log_, moving_vol, moving_coord
         else:
             return log_
+
+
+def extract_tissue_region(image):
+    """Extract tissue region from image as in Kajihara et al."""
+    # Convert to grayscale using UV component in YUV
+    yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV) if len(image.shape) == 3 else cv2.cvtColor(cv2.cvtColor(image, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2YUV)
+    gray = yuv[:, :, 1]  # U component
+
+    # Binary with Otsu
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Find contours
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return np.ones_like(binary, dtype=np.uint8) * 255
+
+    # Largest contour
+    mask = np.zeros_like(binary)
+    cv2.drawContours(mask, [max(contours, key=cv2.contourArea)], -1, 255, -1)
+
+    return mask
+
+
+def non_rigid_register(source, target, k_max=16):
+    """Implement the non-rigid registration from Kajihara et al. 2019"""
+    # Convert to uint8 if not
+    if source.dtype != np.uint8:
+        source = (np.clip(source, 0, 1) * 255).astype(np.uint8)
+    if target.dtype != np.uint8:
+        target = (np.clip(target, 0, 1) * 255).astype(np.uint8)
+
+    # Convert to grayscale if needed
+    if len(source.shape) == 3:
+        source = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+    if len(target.shape) == 3:
+        target = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
+
+    # Extract tissue masks
+    mask_source = extract_tissue_region(cv2.cvtColor(source, cv2.COLOR_GRAY2BGR))
+    mask_target = extract_tissue_region(cv2.cvtColor(target, cv2.COLOR_GRAY2BGR))
+
+    # AKAZE
+    akaze = cv2.AKAZE_create()
+    kp_s, des_s = akaze.detectAndCompute(source, mask_source)
+    kp_t, des_t = akaze.detectAndCompute(target, mask_target)
+
+    # Match
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    matches = matcher.knnMatch(des_s, des_t, k=2)
+
+    # Ratio test
+    good_matches = []
+    for m, n in matches:
+        if m.distance < 0.75 * n.distance:
+            good_matches.append(m)
+
+    if len(good_matches) < 4:
+        return source  # No registration
+
+    # Points
+    pts_s = np.float32([kp_s[m.queryIdx].pt for m in good_matches])
+    pts_t = np.float32([kp_t[m.trainIdx].pt for m in good_matches])
+
+    # Determine K
+    errors = []
+    for k in range(1, k_max + 1):
+        if len(pts_s) < k:
+            break
+        kmeans = KMeans(n_clusters=k, n_init=10)
+        labels = kmeans.fit_predict(pts_s)
+
+        transforms = []
+        centers = []
+        for i in range(k):
+            cluster_s = pts_s[labels == i]
+            cluster_t = pts_t[labels == i]
+            if len(cluster_s) < 4:
+                continue
+            M, _ = cv2.estimateAffinePartial2D(cluster_s.reshape(-1, 1, 2), cluster_t.reshape(-1, 1, 2), cv2.RANSAC)
+            if M is not None:
+                transforms.append(M)
+                centers.append(np.mean(cluster_s, axis=0))
+
+        if not transforms:
+            errors.append(float('inf'))
+            continue
+
+        # For simplicity, compute average error (not full DCIB)
+        error = 0
+        for ps, pt in zip(pts_s, pts_t):
+            # Find closest center
+            dists = [np.linalg.norm(ps - c) for c in centers]
+            idx = np.argmin(dists)
+            M = transforms[idx]
+            ps_h = np.append(ps, 1)
+            pt_pred = M @ ps_h
+            error += np.linalg.norm(pt - pt_pred[:2])
+        errors.append(error / len(pts_s))
+
+    if not errors:
+        return source
+
+    k_opt = np.argmin(errors) + 1
+
+    # Now with k_opt
+    kmeans = KMeans(n_clusters=k_opt, n_init=10)
+    labels = kmeans.fit_predict(pts_s)
+
+    transforms = []
+    centers = []
+    for i in range(k_opt):
+        cluster_s = pts_s[labels == i]
+        cluster_t = pts_t[labels == i]
+        if len(cluster_s) >= 4:
+            M, _ = cv2.estimateAffinePartial2D(cluster_s.reshape(-1, 1, 2), cluster_t.reshape(-1, 1, 2), cv2.RANSAC)
+            if M is not None:
+                transforms.append(M)
+                centers.append(np.mean(cluster_s, axis=0))
+
+    if not transforms:
+        return source
+
+    # For each pixel, find weights and apply average transform (simplified, not DCIB)
+    h = int(round(float(source.shape[0])))
+    w = int(round(float(source.shape[1])))
+    registered = np.zeros_like(source, dtype=np.float32)
+
+    for y in range(h):
+        for x in range(w):
+            p = np.array([x, y])
+            weights = []
+            Ms = []
+            for c, M in zip(centers, transforms):
+                dist = np.linalg.norm(p - c)
+                if dist == 0:
+                    w = 1
+                else:
+                    w = 1 / dist**2
+                weights.append(w)
+                Ms.append(M)
+            weights = np.array(weights)
+            weights /= weights.sum()
+
+            # Average transform (simplified)
+            M_avg = np.zeros((2, 3))
+            for w, M in zip(weights, Ms):
+                M_avg += w * M
+
+            # Apply
+            p_h = np.append(p, 1)
+            p_new = M_avg @ p_h
+            x_new, y_new = p_new[:2]
+
+            if 0 <= x_new < w and 0 <= y_new < h:
+                registered[y, x] = source[int(y_new), int(x_new)]
+            else:
+                registered[y, x] = 0
+
+    return registered.astype(np.uint8)
 
 
