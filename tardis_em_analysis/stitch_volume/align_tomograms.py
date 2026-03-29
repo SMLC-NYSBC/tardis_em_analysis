@@ -27,6 +27,7 @@ from scipy.stats import entropy
 
 
 from tardis_em_analysis import version
+from tardis_em_analysis.stitch_volume.mt_aligner import compute_mt_transform
 from tardis_em_analysis.stitch_volume.utils import sort_tomogram_files
 from tardis_em.utils.export_data import to_am, to_mrc, NumpyToAmira
 from tardis_em.utils.load_data import load_image, ImportDataFromAmira
@@ -1108,7 +1109,10 @@ def stitch_tomogram_stack(
                          f"px: {px}  coords: {coord.shape if coord is not None else 'None'}")
     log_lines.append("")
 
-    aligner = VolumeRidgeRegistration(method=method, down_scale=down_scale)
+    use_mt = method == "mt"
+    aligner = VolumeRidgeRegistration(
+        method="akaze" if use_mt else method, down_scale=down_scale
+    )
     temp_dir = tempfile.mkdtemp()
 
     # 3. Compute pairwise transforms and accumulate
@@ -1119,13 +1123,18 @@ def stitch_tomogram_stack(
     accum_scale = 1.0
     accumulated = [{'Angle': 0.0, 'Tx': 0.0, 'Ty': 0.0, 'Scale': 1.0}]
 
-    log_lines.append("--- Pairwise Registration ---")
+    log_lines.append(f"--- Pairwise Registration ({'MT endpoint matching' if use_mt else method}) ---")
     for i in range(n - 1):
         logger.info(f"Registering pair {i} \u2192 {i + 1} ...")
 
-        metric = aligner(volumes[i], volumes[i + 1], return_aligned=False)
-        metric['Tx'] =  metric['Tx'] / 10
-        metric['Ty'] = metric['Ty'] / 10
+        if use_mt:
+            metric = compute_mt_transform(coords_list[i], coords_list[i + 1])
+            metric['Angle'] = -metric['Angle'] # MT gives the angle to rotate the moving points, but we need to rotate the moving volume in the opposite direction to align it to the fixed volume.
+        else:
+            metric = aligner(volumes[i], volumes[i + 1], return_aligned=False)
+        
+        metric['Tx'] = metric['Tx'] / down_scale # MT gives translation in the original coordinate space, but we need to apply it in the downscaled space used for registration, so we divide by down_scale.
+        metric['Ty'] = metric['Ty'] / down_scale # Same reason as Tx.
         pairwise_transforms.append(metric)
 
         accum_angle += metric['Angle']
@@ -1152,6 +1161,8 @@ def stitch_tomogram_stack(
         log_lines.append(f"    Ty:     {metric['Ty']:.4f}")
         log_lines.append(f"    Scale:  {metric['Scale']:.6f}")
         log_lines.append(f"    Score:  {metric['Score']:.6f}")
+        if use_mt:
+            log_lines.append(f"    Matched MTs: {metric.get('n_matches', 'N/A')}")
         log_lines.append("")
     log_lines.append("")
 
