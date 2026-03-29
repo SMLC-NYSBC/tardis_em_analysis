@@ -7,22 +7,28 @@
 #  Robert Kiewisz, Tristan Bepler                                     #
 #  MIT License 2021 - 2025                                            #
 #######################################################################
+import logging
 import time
+import tempfile
+import shutil
 from datetime import datetime
 from os import mkdir
 from os.path import isdir, split, splitext, join
 from typing import Union
 import cv2
+from sklearn.cluster import KMeans
 
 import numpy as np
 import tifffile.tifffile as tiff
 from scipy import optimize
 from scipy.ndimage import zoom, affine_transform, shift, gaussian_filter
-from scipy.signal import correlate2d
 from scipy.stats import entropy
 
+
+
 from tardis_em_analysis import version
-from tardis_em.stitch_volume.utils import sort_tomogram_files
+from tardis_em_analysis.stitch_volume.mt_aligner import compute_mt_transform
+from tardis_em_analysis.stitch_volume.utils import sort_tomogram_files
 from tardis_em.utils.export_data import to_am, to_mrc, NumpyToAmira
 from tardis_em.utils.load_data import load_image, ImportDataFromAmira
 from tardis_em.utils.logo import print_progress_bar, TardisLogo
@@ -38,7 +44,8 @@ class AlignTomograms:
         self.output_path = output_path
         self.method = method.lower()
 
-        assert method in ['sift', 'warp', 'powell'], f'Method must be one of ["sift", "powell"], but got {method}'
+        _valid = ['sift', 'warp', 'powell', 'akaze']
+        assert method in _valid, f'Method must be one of {_valid}, but got {method}'
         assert len(self.images_path) == len(self.coords_path), \
             (f'Image and coord path must have same length! '
              f'But images {len(self.images_path)} != coors {len(self.coords_path)}')
@@ -189,8 +196,8 @@ class AlignTomograms:
                 self.moving_data['Coordinates'] = am.get_segmented_points()
                 self.moving_data['Amira_Transformation'] = am.transformation
             else:
-                self.moving_data['Coordinates'] = np.genfromtxt(dir_coord_1, delimiter=",", skip_header=1)
-                img_2, px_2 = load_image(dir_img_1)
+                self.moving_data['Coordinates'] = np.genfromtxt(dir_coord_2, delimiter=",", skip_header=1)
+                img_2, px_2 = load_image(dir_img_2)
         self.moving_data['Image'] = img_2
         self.moving_data['Pixel_Size'] = px_2
 
@@ -281,12 +288,6 @@ class AlignTomograms:
         self.save_log()
         self.update_progress(i, metric)
 
-        moving_vol = self.moving_data['Image'].shape
-        # self.moving_data['Image'] = self.course_aligner.get_ridge_transform(self.moving_data['Image'])
-        # self.moving_data['Coordinates'] = self.course_aligner.get_ridge_transform_coord(moving_vol,
-        #                                                                                 self.moving_data['Coordinates'],
-        #                                                                                 *self.moving_data['Image'].shape[1:])
-
         # Save tomogram n+1 under the same file format
         self.log_prediction.append("  - Saved aligned moving data:")
         self.save_log()
@@ -372,11 +373,15 @@ class VolumeRidgeRegistration:
             log_=False,
     ):
         method = method.lower()
-        assert method in ['sift', 'warp', 'powell'], f'Method must be one of ["sift", "powell"], but got {method}'
+        _valid = ['sift', 'warp', 'powell', 'akaze']
+        assert method in _valid, f'Method must be one of {_valid}, but got {method}'
         self.mean_std = MeanStdNormalize()
         self.normalize = RescaleNormalize(clip_range=(.1, 99.9))
 
-        self.method, self.optimize_fn = method, 'mse'
+        self.method = method
+        # Mutual information is more robust for EM cross-section alignment
+        # where tissue may be partially lost between sections
+        self.optimize_fn = 'mi' if method == 'powell' else 'mse'
 
         self.down_scale = down_scale
         self.ridge_operation = 'rst'
@@ -384,32 +389,35 @@ class VolumeRidgeRegistration:
         self.Angle, self.Ty, self.Tx, self.Scale, self.Score = 0.0, 0.0, 0.0, 1.0, 0.0
 
         self.mask_fix, self.mask_moving = None, None
+        self.img2_y, self.img2_x = 0, 0
 
         self.log_ = log_
 
     def volume_to_projection(self, img1, img2, original_=False, transform_fixed=None):
-        im1_pos = int(img1.shape[0] * 0.05)
-        im2_pos = int(img2.shape[0] * 0.05)
+        # Adaptive slice count: 5% of depth, clamped to [5, 5]
+        n_slices_1 = max(5, min(5, int(img1.shape[0] * 0.05)))
+        n_slices_2 = max(5, min(5, int(img2.shape[0] * 0.05)))
 
-        img1 = np.sum(img1[-im1_pos:, ...], axis=0)
+        # Mean projection: more stable than sum, avoids overflow, better SNR
+        img1 = np.sum(img1[-n_slices_1:, ...], axis=0).astype(np.float32)
         img1 = zoom(img1, 1 / self.down_scale)
-        img2 = np.sum(img2[:im2_pos, ...], axis=0)
+        img2 = np.sum(img2[:n_slices_2, ...], axis=0).astype(np.float32)
         img2 = zoom(img2, 1 / self.down_scale)
 
-        self.img2_y, self.img2_x = 0, 0
+        # Store dimensions after downscale (used for Powell bounds)
+        self.img2_y, self.img2_x = img2.shape
+
         if not original_:
             img1, img2 = gaussian_filter(img1, sigma=1.5), gaussian_filter(img2, sigma=1.5)
             img1 = self.normalize((self.mean_std(img1)).astype(np.float32))
-            img1 = (img1 - img1.min()) / (img1.max() - img1.min())
+            img1 = (img1 - img1.min()) / (img1.max() - img1.min() + 1e-10)
             img1 = np.clip(img1, 0, 1)
             img2 = self.normalize((self.mean_std(img2)).astype(np.float32))
-            img2 = (img2 - img2.min()) / (img2.max() - img2.min())
+            img2 = (img2 - img2.min()) / (img2.max() - img2.min() + 1e-10)
             img2 = np.clip(img2, 0, 1)
 
             self.mask_fix = np.ones_like(img1, dtype=np.uint8)
             self.mask_moving = np.ones_like(img2, dtype=np.uint8)
-            self.img2_y, self.img2_x = img2.shape
-            self.img2_y, self.img2_x = int(self.img2_y / self.down_scale), int(self.img2_x / self.img2_y / self.down_scale)
 
         pad = int((np.sqrt(img1.shape[0] ** 2 + img1.shape[1] ** 2)) - img1.shape[0]) // 2
         img1 = np.pad(img1, ((pad, pad), (pad, pad)), mode="constant", constant_values=0)
@@ -422,17 +430,17 @@ class VolumeRidgeRegistration:
         if transform_fixed is not None:
             img1 = self.apply_rigid_transform(img1,
                                               transform_fixed['Angle'],
-                                              transform_fixed['Tx'] * 1 / self.down_scale,
-                                              transform_fixed['Ty'] * 1 / self.down_scale,
+                                              transform_fixed['Tx'] / self.down_scale,
+                                              transform_fixed['Ty'] / self.down_scale,
                                               transform_fixed['Scale'])
 
             if not original_:
                 self.mask_fix = self.apply_rigid_transform(self.mask_fix,
                                                   transform_fixed['Angle'],
-                                                  transform_fixed['Tx'] * 1 / self.down_scale,
-                                                  transform_fixed['Ty'] * 1 / self.down_scale,
+                                                  transform_fixed['Tx'] / self.down_scale,
+                                                  transform_fixed['Ty'] / self.down_scale,
                                                   transform_fixed['Scale'])
-                self.mask_fix = np.where(self.mask_fix > 0, 1, 0)
+                self.mask_fix = np.where(self.mask_fix > 0, 1, 0).astype(np.uint8)
 
         return img1, img2
 
@@ -475,10 +483,11 @@ class VolumeRidgeRegistration:
 
         return points_copy
 
-    def loss_function_ssim(self, img1, img2, valid_mask, sigma=1.5, C1=0.01 ** 2, C2=0.03 ** 2):
-        img1 = img1.astype(float)[valid_mask]
-        img2 = img2.astype(float)[valid_mask]
-        # Gaussian blur for stability
+    def loss_function_ssim(self, img1, img2, valid_mask_2d, sigma=1.5, C1=0.01 ** 2, C2=0.03 ** 2):
+        """Compute SSIM loss on full 2D images, averaged over valid mask region."""
+        img1 = img1.astype(float)
+        img2 = img2.astype(float)
+
         mu1 = gaussian_filter(img1, sigma)
         mu2 = gaussian_filter(img2, sigma)
         mu1_sq = mu1 ** 2
@@ -491,7 +500,10 @@ class VolumeRidgeRegistration:
         ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
                     (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
 
-        loss = -np.mean(ssim_map)
+        if valid_mask_2d.sum() == 0:
+            return 0.0
+
+        loss = -np.mean(ssim_map[valid_mask_2d])
 
         if self.log_:
             print(loss)
@@ -553,22 +565,17 @@ class VolumeRidgeRegistration:
         return loss
 
     def loss_function_normalized_cross_correlation(self, img1, img2, valid_mask):
-        """Compute Normalized Cross-Correlation between two images."""
-        # Ensure images are the same size
+        """Compute Normalized Cross-Correlation between two images over valid region."""
         if img1.shape != img2.shape:
             raise ValueError("Images must have the same dimensions for NCC")
 
-        # Flatten images and normalize
-        img1 = img1[valid_mask]
-        img2 = img2[valid_mask]
+        v1 = img1[valid_mask].astype(float)
+        v2 = img2[valid_mask].astype(float)
 
-        # Subtract mean and compute standard deviation
-        img1 = (img1 - np.mean(img1)) / np.std(img1)
-        img2 = (img2 - np.mean(img2)) / np.std(img2)
-        corr = correlate2d(img1, img2, mode='valid')
+        v1 = (v1 - np.mean(v1)) / (np.std(v1) + 1e-10)
+        v2 = (v2 - np.mean(v2)) / (np.std(v2) + 1e-10)
 
-        # Compute NCC
-        loss = -(np.max(corr) / (img1.shape[0] * img1.shape[1]))
+        loss = -np.mean(v1 * v2)
 
         if self.log_:
             print(loss)
@@ -671,67 +678,108 @@ class VolumeRidgeRegistration:
         return img
 
     def find_best_ridge_transformation(self, params, fixed, moving):
-        """Objective function to minimize (negative NCC)."""
+        """Objective function to minimize for intensity-based registration."""
         moving_T = self.apply_rigid_transform(moving, *params)
 
-        # Pad image borders for interpolation artefacts
-        moving_T[:2, :] = 0  # top row
-        moving_T[-2:, :] = 0  # bottom row
-        moving_T[:, :2] = 0  # left column
-        moving_T[:, -2:] = 0  # right column
+        # Zero borders to avoid interpolation artefacts
+        moving_T[:2, :] = 0
+        moving_T[-2:, :] = 0
+        moving_T[:, :2] = 0
+        moving_T[:, -2:] = 0
 
-        valid_mask = np.where(self.apply_rigid_transform(self.mask_moving, *params) > 0, 1, 0)
-        valid_mask = np.where(np.logical_and(valid_mask != 0, self.mask_fix != 0))
-        mean_, std_ = np.mean(moving_T[valid_mask]), np.std(moving_T[valid_mask])
-        moving_T[valid_mask] = (moving_T[valid_mask] - mean_) / std_
+        # Build valid region mask (2D boolean)
+        moved_mask = self.apply_rigid_transform(self.mask_moving, *params)
+        valid_2d = np.logical_and(moved_mask > 0, self.mask_fix > 0)
+        valid_idx = np.where(valid_2d)
+
+        if valid_idx[0].size == 0:
+            return 1e10
+
+        # Normalize both images symmetrically within the valid region
+        f_mean, f_std = np.mean(fixed[valid_idx]), np.std(fixed[valid_idx]) + 1e-10
+        m_mean, m_std = np.mean(moving_T[valid_idx]), np.std(moving_T[valid_idx]) + 1e-10
+
+        fixed_norm = fixed.copy()
+        fixed_norm[valid_idx] = (fixed_norm[valid_idx] - f_mean) / f_std
+        moving_T[valid_idx] = (moving_T[valid_idx] - m_mean) / m_std
 
         if self.optimize_fn == "mi":
-            return self.loss_function_mutual_information(fixed, moving_T, valid_mask)
+            # MI is invariant to intensity transforms, use unnormalized
+            return self.loss_function_mutual_information(fixed, moving_T, valid_idx)
         elif self.optimize_fn == "mse":
-            return self.loss_function_mean_squared_error(fixed, moving_T, valid_mask)
+            return self.loss_function_mean_squared_error(fixed_norm, moving_T, valid_idx)
         elif self.optimize_fn == "l2":
-            return self.loss_function_l2(fixed, moving_T, valid_mask)
+            return self.loss_function_l2(fixed_norm, moving_T, valid_idx)
         elif self.optimize_fn == "ncc":
-            return self.loss_function_normalized_cross_correlation(fixed, moving_T, valid_mask)
+            return self.loss_function_normalized_cross_correlation(fixed_norm, moving_T, valid_idx)
         elif self.optimize_fn == "ssim":
-            return self.loss_function_ssim(fixed, moving_T, valid_mask)
+            # SSIM needs full 2D images with boolean mask
+            return self.loss_function_ssim(fixed_norm, moving_T, valid_2d)
         elif self.optimize_fn == "mse_mi":
-            return (self.loss_function_mean_squared_error(fixed, moving_T, valid_mask)
-                    + self.loss_function_mutual_information(fixed, moving_T, valid_mask))
+            return (self.loss_function_mean_squared_error(fixed_norm, moving_T, valid_idx)
+                    + self.loss_function_mutual_information(fixed, moving_T, valid_idx))
 
     def optim_align_images(self, fixed_img, moving_img):
-        """Align moving_img to fixed_img using intensity-based registration."""
-        if self.method == "sift":
-            fixed_img = np.clip(fixed_img * 255.0, 0, 255).astype(np.uint8)
-            self.mask_fix = np.clip(self.mask_fix, 0, 1).astype(np.uint8)
-            moving_img = np.clip(moving_img * 255.0, 0, 255).astype(np.uint8)
-            self.mask_moving = np.clip(self.mask_moving, 0, 1).astype(np.uint8)
+        """Align moving_img to fixed_img using feature-based or intensity-based registration."""
+        if self.method in ["sift", "akaze"]:
+            # Convert to uint8 with CLAHE for better feature detection in low-SNR EM
+            fixed_uint8 = np.clip(fixed_img * 255.0, 0, 255).astype(np.uint8)
+            moving_uint8 = np.clip(moving_img * 255.0, 0, 255).astype(np.uint8)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            fixed_uint8 = clahe.apply(fixed_uint8)
+            moving_uint8 = clahe.apply(moving_uint8)
 
-            self.Angle, self.Tx, self.Ty, self.Scale = self.align_images_sift(fixed_img, moving_img)
-        if self.method == "warp":
-            self.Angle, self.Tx, self.Ty, self.Scale = self.align_images_warp(fixed_img, moving_img)
+            # OpenCV masks must be 0/255 uint8
+            mask_fix = (np.clip(self.mask_fix, 0, 1) * 255).astype(np.uint8)
+            mask_moving = (np.clip(self.mask_moving, 0, 1) * 255).astype(np.uint8)
 
-        if (self.Angle == 0 and self.Tx == 0 and self.Ty == 0 and self.Scale == 1) or self.method == 'powell':
-            # Initial guess: no rotation, no translation
-            initial_params = [self.Angle, self.Tx, self.Ty, self.Scale]  # [angle, tx, ty, Scale]
+            if self.method == "sift":
+                self.Angle, self.Tx, self.Ty, self.Scale = self.align_images_sift(
+                    fixed_uint8, moving_uint8, mask_fix, mask_moving)
+            else:
+                self.Angle, self.Tx, self.Ty, self.Scale = self.align_images_akaze(
+                    fixed_uint8, moving_uint8, mask_fix, mask_moving)
 
-            # Define bounds for optimization
+        elif self.method == "warp":
+            mask_moving_uint8 = (np.clip(self.mask_moving, 0, 1) * 255).astype(np.uint8)
+            self.Angle, self.Tx, self.Ty, self.Scale = self.align_images_warp(
+                fixed_img, moving_img, mask_moving_uint8)
+
+        elif self.method == 'powell':
+            # Use SIFT as initialization to avoid local minima
+            try:
+                fixed_uint8 = np.clip(fixed_img * 255.0, 0, 255).astype(np.uint8)
+                moving_uint8 = np.clip(moving_img * 255.0, 0, 255).astype(np.uint8)
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                fixed_clahe = clahe.apply(fixed_uint8)
+                moving_clahe = clahe.apply(moving_uint8)
+                mask_fix = (np.clip(self.mask_fix, 0, 1) * 255).astype(np.uint8)
+                mask_moving = (np.clip(self.mask_moving, 0, 1) * 255).astype(np.uint8)
+                init_a, init_tx, init_ty, init_s = self.align_images_sift(
+                    fixed_clahe, moving_clahe, mask_fix, mask_moving)
+                # Fall back to identity if SIFT returned degenerate result
+                if init_s < 0.5 or init_s > 2.0:
+                    init_a, init_tx, init_ty, init_s = 0.0, 0.0, 0.0, 1.0
+            except Exception:
+                init_a, init_tx, init_ty, init_s = 0.0, 0.0, 0.0, 1.0
+
+            initial_params = [init_a, init_tx, init_ty, init_s]
+
             bounds = [
                 (-180.0, 180.0) if "r" in self.ridge_operation else (0.0, 0.0),
                 (
-                    (-self.img2_x // 4, self.img2_x // 4)
+                    (-self.img2_x // 2, self.img2_x // 2)
                     if "t" in self.ridge_operation
                     else (0.0, 0.0)
                 ),
                 (
-                    (-self.img2_y // 4, self.img2_y // 4)
+                    (-self.img2_y // 2, self.img2_y // 2)
                     if "t" in self.ridge_operation
                     else (0.0, 0.0)
                 ),
-                (0.9, 1.1) if "s" in self.ridge_operation else (1.0, 1.0),
+                (0.85, 1.15) if "s" in self.ridge_operation else (1.0, 1.0),
             ]
 
-            np.random.seed(42)
             result = optimize.minimize(
                 self.find_best_ridge_transformation,
                 initial_params,
@@ -741,18 +789,23 @@ class VolumeRidgeRegistration:
                 tol=1e-9,
             )
 
-            # Extract optimal parameters
             self.Angle, self.Tx, self.Ty, self.Scale = result.x
             self.Score = result.fun
 
-        self.Ty /= 1 / self.down_scale
-        self.Tx /= 1 / self.down_scale
+        # Scale translations from downscaled projection space to full-resolution
+        self.Ty *= self.down_scale
+        self.Tx *= self.down_scale
 
-    def align_images_sift(self, reference: np.ndarray, moving: np.ndarray, max_features=500, good_match_ratio=0.75):
+    def align_images_sift(self, reference: np.ndarray, moving: np.ndarray,
+                          mask_fix: np.ndarray = None, mask_moving: np.ndarray = None,
+                          max_features=500, good_match_ratio=0.75):
         # Detect SIFT features and descriptors
         sift = cv2.SIFT_create()
-        kp_ref, des_ref = sift.detectAndCompute(reference, self.mask_fix)
-        kp_mov, des_mov = sift.detectAndCompute(moving, self.mask_moving)
+        kp_ref, des_ref = sift.detectAndCompute(reference, mask_fix)
+        kp_mov, des_mov = sift.detectAndCompute(moving, mask_moving)
+
+        if des_ref is None or des_mov is None or len(des_ref) < 2 or len(des_mov) < 2:
+            return 0, 0, 0, 1
 
         # Match features using BFMatcher with a ratio test
         matcher = cv2.BFMatcher(cv2.NORM_L2)
@@ -775,20 +828,93 @@ class VolumeRidgeRegistration:
         pts_ref = np.float32([kp_ref[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
 
         # Estimate similarity transformation (rotation, translation, scale) with RANSAC
-        matrix, _ = cv2.estimateAffinePartial2D(pts_mov, pts_ref, method=cv2.RANSAC)
+        matrix, inliers = cv2.estimateAffinePartial2D(pts_mov, pts_ref, method=cv2.RANSAC)
+
+        if matrix is None:
+            return 0, 0, 0, 1
 
         scale = np.sqrt(matrix[0, 0] ** 2 + matrix[0, 1] ** 2)
+
+        # Reject degenerate results (scale near 0 or wildly off)
+        if scale < 0.5 or scale > 2.0:
+            return 0, 0, 0, 1
+
         angle = np.arctan2(matrix[0, 1], matrix[0, 0]) * 180 / np.pi
         tx, ty = matrix[0, 2], matrix[1, 2]
 
-        return angle, tx, ty, 1.0
+        return angle, tx, ty, scale
 
-    def align_images_warp(self, reference: np.ndarray, moving: np.ndarray, max_iter=5000, epsilon=1e-5):
-        warp_mode = cv2.MOTION_HOMOGRAPHY
-        warp_matrix = np.zeros((3, 3), dtype=np.float32)
+    def align_images_akaze(self, reference: np.ndarray, moving: np.ndarray,
+                           mask_fix: np.ndarray = None, mask_moving: np.ndarray = None,
+                           max_features=500, good_match_ratio=0.75):
+        # Detect AKAZE features and descriptors
+        akaze = cv2.AKAZE_create()
+        kp_ref, des_ref = akaze.detectAndCompute(reference, mask_fix)
+        kp_mov, des_mov = akaze.detectAndCompute(moving, mask_moving)
 
+        if des_ref is None or des_mov is None or len(des_ref) < 2 or len(des_mov) < 2:
+            return 0, 0, 0, 1
+
+        # Match features using BFMatcher with Hamming distance
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        raw_matches = matcher.knnMatch(des_mov, des_ref, k=2)  # Query: moving, Train: reference
+
+        # Apply ratio test for good matches
+        good_matches = []
+        for m, n in raw_matches:
+            if m.distance < good_match_ratio * n.distance:
+                good_matches.append(m)
+
+        # Sort by distance and limit if needed
+        good_matches = sorted(good_matches, key=lambda x: x.distance)[:max_features]
+
+        if len(good_matches) < 4:  # Need at least 4 for similarity
+            return 0, 0, 0, 1
+
+        # Extract points
+        pts_mov = np.float32([kp_mov[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        pts_ref = np.float32([kp_ref[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+        # Estimate similarity transformation (rotation, translation, scale) with RANSAC
+        matrix, inliers = cv2.estimateAffinePartial2D(pts_mov, pts_ref, method=cv2.RANSAC)
+
+        if matrix is None:
+            return 0, 0, 0, 1
+
+        scale = np.sqrt(matrix[0, 0] ** 2 + matrix[0, 1] ** 2)
+
+        # Reject degenerate results (scale near 0 or wildly off)
+        if scale < 0.5 or scale > 2.0:
+            return 0, 0, 0, 1
+
+        angle = np.arctan2(matrix[0, 1], matrix[0, 0]) * 180 / np.pi
+        tx, ty = matrix[0, 2], matrix[1, 2]
+
+        return angle, tx, ty, scale
+
+    def align_images_warp(self, reference: np.ndarray, moving: np.ndarray,
+                          mask_moving: np.ndarray = None, max_iter=1000, epsilon=1e-4):
+        # warp_mode = cv2.MOTION_HOMOGRAPHY
+        # warp_matrix = np.eye(3, dtype=np.float32)
+        warp_mode = cv2.MOTION_EUCLIDEAN     # or even MOTION_EUCLIDEAN for start
+        warp_matrix = np.eye(2, 3, dtype=np.float32)   # 2×3
+
+        
         criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, max_iter, epsilon)
-        cc, warp_matrix = cv2.findTransformECC(reference, moving, warp_matrix, warp_mode, criteria, self.mask_fix)
+
+        def normalize_for_ecc(img):
+            img = img.astype(np.float32)
+            img -= np.mean(img)
+            img /= (np.std(img) + 1e-8)          # avoid div-by-zero
+            return img
+
+        reference_norm = normalize_for_ecc(reference)
+        moving_norm    = normalize_for_ecc(moving)
+
+        _, warp_matrix = cv2.findTransformECC(reference_norm, moving_norm, warp_matrix, warp_mode, criteria, mask_moving)
+
+        if np.isnan(warp_matrix).any():
+            return 0.0, 0.0, 0.0, 1.0
 
         angle = np.arctan2(warp_matrix[0, 1], warp_matrix[0, 0]) * 180 / np.pi
         tx, ty = warp_matrix[0, 2], warp_matrix[1, 2]
@@ -819,7 +945,7 @@ class VolumeRidgeRegistration:
             moving_coord[:, 1] = moving_coord[:, 1] + pad_H[0]
             moving_coord[:, 2] = moving_coord[:, 2] + pad_W[0]
 
-        M = self.compute_transformation_matrix(cy, cx, self.Angle, 1.)
+        M = self.compute_transformation_matrix(cy, cx, self.Angle, self.Scale)
         M = np.linalg.inv(M)
 
         coords = np.ones((moving_coord.shape[0], 3))
@@ -870,3 +996,289 @@ class VolumeRidgeRegistration:
             return log_
 
 
+def to_am_stack(temp_files, shapes, pixel_size, filename):
+    """Create AM file for stacked volumes by loading temp files sequentially to reduce RAM usage."""
+    max_y = max(s[1] for s in shapes)
+    max_x = max(s[2] for s in shapes)
+    full_z = sum(s[0] for s in shapes)
+    dtype = np.load(temp_files[0]).dtype
+
+    stitched_vol = np.empty((full_z, max_y, max_x), dtype=dtype)
+    z_offset = 0
+
+    for temp_file, shape in zip(temp_files, shapes):
+        vol = np.load(temp_file)
+        dy = max_y - shape[1]
+        dx = max_x - shape[2]
+        if dy > 0 or dx > 0:
+            vol = np.pad(vol, ((0, 0), (dy // 2, dy - dy // 2), (dx // 2, dx - dx // 2)),
+                         mode='constant', constant_values=0)
+        stitched_vol[z_offset:z_offset + shape[0], :, :] = vol
+        z_offset += shape[0]
+
+    to_am(stitched_vol.astype(np.int8), pixel_size, filename)
+
+
+def stitch_tomogram_stack(
+    input_dir: str,
+    output_dir: str,
+    method: str = 'akaze',
+    down_scale: int = 10,
+):
+    """
+    Align and stitch a stack of serial-section tomograms from a single folder.
+
+    Workflow:
+        1. Discover tomogram images and matching spatial graphs using sort_tomogram_files.
+        2. Register each consecutive pair (i → i+1) to obtain a pairwise ridge
+           transform (angle, tx, ty, scale).
+        3. Accumulate transforms so that every tomogram is expressed in the
+           coordinate frame of the first tomogram.
+        4. Apply the accumulated transform to each volume and spatial graph.
+        5. Stack all transformed volumes and merge all spatial graphs into a
+           single output.
+
+    Args:
+        input_dir:  Folder containing .am tomogram images and *_spatialGraph.am files.
+        output_dir: Folder where the stitched volume and merged spatial graph will
+                    be written.
+        method:     Registration method forwarded to VolumeRidgeRegistration
+                    (default 'akaze').
+        down_scale: Downscale factor for the 2-D projection used during
+                    registration (default 10).
+
+    Returns:
+        A list of per-pair transform dicts [{Angle, Tx, Ty, Scale, Score}, …].
+    """
+    from os import makedirs
+    from os.path import join as pjoin, basename
+
+    logger = logging.getLogger("tardis_em")
+
+    makedirs(output_dir, exist_ok=True)
+
+    # Log file collects all pipeline information
+    log_lines = [
+        "###############################################################################",
+        "# TARDIS - Transformer And Rapid Dimensionless Instance Segmentation (R)      #",
+        f"# tardis_em v{version}",
+        f"# MIT License * 2021-{datetime.now().year} | Robert Kiewisz & Tristan Bepler",
+        "###############################################################################",
+        "",
+        "--- Settings ---",
+        f"Input directory:  {input_dir}",
+        f"Output directory: {output_dir}",
+        f"Method: {method}",
+        f"Down scale: {down_scale}",
+        "",
+    ]
+
+    # 1. Discover files
+    image_paths, coord_paths = sort_tomogram_files(input_dir)
+    n = len(image_paths)
+    assert n >= 2, f"Need at least 2 tomograms, found {n} in {input_dir}"
+    assert len(image_paths) == len(coord_paths)
+
+    logger.info(f"Found {n} tomograms in {input_dir}")
+
+    log_lines.append(f"--- Detected Files ({n} tomograms) ---")
+    for i, (ip, cp) in enumerate(zip(image_paths, coord_paths)):
+        log_lines.append(f"  [{i}] Image:  {basename(ip)}")
+        log_lines.append(f"      Coords: {basename(cp) if cp else 'None'}")
+    log_lines.append("")
+
+    # 2. Load all volumes and coords up-front (needed for accumulation)
+    volumes = []
+    coords_list = []
+    pixel_sizes = []
+
+    log_lines.append("--- Loaded Volumes ---")
+    for idx, (img_p, coord_p) in enumerate(zip(image_paths, coord_paths)):
+        if coord_p is not None and coord_p.endswith(".am"):
+            am = ImportDataFromAmira(coord_p, img_p)
+            vol, px = am.get_image()
+            coord = am.get_segmented_points()
+        else:
+            vol, px = load_image(img_p)
+            coord = None
+        volumes.append(vol)
+        coords_list.append(coord)
+        pixel_sizes.append(px)
+
+        log_lines.append(f"  [{idx}] Shape: {vol.shape}  dtype: {vol.dtype}  "
+                         f"px: {px}  coords: {coord.shape if coord is not None else 'None'}")
+    log_lines.append("")
+
+    use_mt = method == "mt"
+    aligner = VolumeRidgeRegistration(
+        method="akaze" if use_mt else method, down_scale=down_scale
+    )
+    temp_dir = tempfile.mkdtemp()
+
+    # 3. Compute pairwise transforms and accumulate
+    pairwise_transforms = []
+    accum_angle = 0.0
+    accum_tx = 0.0
+    accum_ty = 0.0
+    accum_scale = 1.0
+    accumulated = [{'Angle': 0.0, 'Tx': 0.0, 'Ty': 0.0, 'Scale': 1.0}]
+
+    log_lines.append(f"--- Pairwise Registration ({'MT endpoint matching' if use_mt else method}) ---")
+    for i in range(n - 1):
+        logger.info(f"Registering pair {i} \u2192 {i + 1} ...")
+
+        if use_mt:
+            metric = compute_mt_transform(coords_list[i], coords_list[i + 1])
+            metric['Angle'] = -metric['Angle'] # MT gives the angle to rotate the moving points, but we need to rotate the moving volume in the opposite direction to align it to the fixed volume.
+        else:
+            metric = aligner(volumes[i], volumes[i + 1], return_aligned=False)
+        
+        metric['Tx'] = metric['Tx'] / down_scale # MT gives translation in the original coordinate space, but we need to apply it in the downscaled space used for registration, so we divide by down_scale.
+        metric['Ty'] = metric['Ty'] / down_scale # Same reason as Tx.
+        pairwise_transforms.append(metric)
+
+        accum_angle += metric['Angle']
+        accum_tx += metric['Tx']
+        accum_ty += metric['Ty']
+        accum_scale *= metric['Scale']
+
+        accumulated.append({
+            'Angle': accum_angle,
+            'Tx': accum_tx,
+            'Ty': accum_ty,
+            'Scale': accum_scale,
+        })
+
+        logger.info(f"Pair {i}\u2192{i+1}: Angle={metric['Angle']:.2f}  Tx={metric['Tx']:.1f}  "
+                    f"Ty={metric['Ty']:.1f}  Scale={metric['Scale']:.4f}  "
+                    f"Score={metric['Score']:.4f}")
+
+        log_lines.append(f"  Pair {i} \u2192 {i+1}:")
+        log_lines.append(f"    Fixed:  {basename(image_paths[i])}")
+        log_lines.append(f"    Moving: {basename(image_paths[i+1])}")
+        log_lines.append(f"    Angle:  {metric['Angle']:.4f}")
+        log_lines.append(f"    Tx:     {metric['Tx']:.4f}")
+        log_lines.append(f"    Ty:     {metric['Ty']:.4f}")
+        log_lines.append(f"    Scale:  {metric['Scale']:.6f}")
+        log_lines.append(f"    Score:  {metric['Score']:.6f}")
+        if use_mt:
+            log_lines.append(f"    Matched MTs: {metric.get('n_matches', 'N/A')}")
+        log_lines.append("")
+    log_lines.append("")
+
+    # 4. Transform each volume, save to temp files, and transform coordinates
+    temp_files = []
+    shapes = []
+    transformed_coords = []
+    save_am_coord = NumpyToAmira()
+
+    log_lines.append("--- Accumulated Transforms (per tomogram) ---")
+    for i in range(n):
+        t = accumulated[i]
+        logger.info(f"Transforming tomogram {i} (accum: Angle={t['Angle']:.2f}, "
+                    f"Tx={t['Tx']:.1f}, Ty={t['Ty']:.1f}, Scale={t['Scale']:.4f})")
+
+        log_lines.append(f"  [{i}] {basename(image_paths[i])}")
+        log_lines.append(f"    Angle:  {t['Angle']:.4f}")
+        log_lines.append(f"    Tx:     {t['Tx']:.4f}")
+        log_lines.append(f"    Ty:     {t['Ty']:.4f}")
+        log_lines.append(f"    Scale:  {t['Scale']:.6f}")
+
+        if i == 0:
+            vol = volumes[i]
+        else:
+            aligner.Angle = t['Angle']
+            aligner.Tx = t['Tx']
+            aligner.Ty = t['Ty']
+            aligner.Scale = t['Scale']
+
+            vol = aligner.get_ridge_transform(volumes[i], reshape=True)
+
+        temp_path = join(temp_dir, f'temp_{i}.npy')
+        np.save(temp_path, vol)
+        shapes.append(vol.shape)
+        temp_files.append(temp_path)
+
+        log_lines.append(f"    Output shape: {vol.shape}")
+        log_lines.append("")
+
+        # Transform coordinates if available
+        coord = coords_list[i]
+        if coord is not None and i > 0:
+            aligner.Angle = t['Angle']
+            aligner.Tx = t['Tx']
+            aligner.Ty = t['Ty']
+            aligner.Scale = t['Scale']
+
+            vol_shape = volumes[i].shape
+            coord_transformed = aligner.get_ridge_transform_coord(
+                vol_shape, coord.copy(),
+                *vol.shape[1:]
+            )
+            transformed_coords.append(coord_transformed)
+        else:
+            transformed_coords.append(coord)
+
+    # Free memory
+    del volumes
+
+    # 5. Create stitched AM volume from temp files
+    px = pixel_sizes[0] if pixel_sizes[0] is not None else 1.0
+    stitched_path = pjoin(output_dir, 'stitched_volume.am')
+    to_am_stack(temp_files, shapes, px, stitched_path)
+    full_z = sum(s[0] for s in shapes)
+    max_y = max(s[1] for s in shapes)
+    max_x = max(s[2] for s in shapes)
+    logger.info(f"Stitched volume shape: {(full_z, max_y, max_x)}")
+    logger.info(f"Saved stitched volume to {stitched_path}")
+
+    # 6. Merge spatial graphs — shift Z, centre XY, and re-number segment IDs
+    merged_coords = []
+    z_offset = 0
+    id_offset = 0
+    for i, coord in enumerate(transformed_coords):
+        if coord is not None:
+            c = coord.copy()
+            c[:, 0] += id_offset
+            # Mirror the symmetric padding applied by to_am_stack so that
+            # coordinates stay aligned with the stitched volume canvas.
+            dy = max_y - shapes[i][1]
+            dx = max_x - shapes[i][2]
+            c[:, 1] += dy // 2  # axis-1 (shape[1]) offset
+            c[:, 2] += dx // 2  # axis-2 (shape[2]) offset
+            c[:, 3] += z_offset
+            merged_coords.append(c)
+            id_offset = int(c[:, 0].max()) + 1
+        z_offset += shapes[i][0]
+
+    if merged_coords:
+        merged = np.concatenate(merged_coords, axis=0)
+        save_am_coord.export_amiraV2(pjoin(output_dir, 'stitched_spatialGraph.am'), merged)
+        logger.info(f"Saved merged spatial graph ({merged.shape[0]} points, "
+                    f"{int(merged[:, 0].max()) + 1} segments) to "
+                    f"{pjoin(output_dir, 'stitched_spatialGraph.am')}")
+    else:
+        logger.warning("No spatial graphs found to merge.")
+
+    # 7. Write log file
+    log_lines.append("--- Stitched Output ---")
+    log_lines.append(f"  Volume shape: {(full_z, max_y, max_x)}  dtype: int8")
+    log_lines.append(f"  Pixel size:   {px}")
+    log_lines.append(f"  Volume file:  {pjoin(output_dir, 'stitched_volume.am')}")
+    if merged_coords:
+        log_lines.append(f"  SpatialGraph: {pjoin(output_dir, 'stitched_spatialGraph.am')}")
+        log_lines.append(f"  Total points:   {merged.shape[0]}")
+        log_lines.append(f"  Total segments: {int(merged[:, 0].max()) + 1}")
+    else:
+        log_lines.append("  SpatialGraph: None (no coordinate files found)")
+    log_lines.append("")
+
+    log_path = pjoin(output_dir, "stitch_log.txt")
+    with open(log_path, "w") as f:
+        f.write("\n".join(log_lines))
+    logger.info(f"Saved log to {log_path}")
+
+    # Clean up temp files
+    shutil.rmtree(temp_dir)
+
+    return pairwise_transforms
