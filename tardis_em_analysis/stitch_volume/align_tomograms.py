@@ -9,6 +9,8 @@
 #######################################################################
 import logging
 import time
+import tempfile
+import shutil
 from datetime import datetime
 from os import mkdir
 from os.path import isdir, split, splitext, join
@@ -22,9 +24,7 @@ from scipy import optimize
 from scipy.ndimage import zoom, affine_transform, shift, gaussian_filter
 from scipy.stats import entropy
 
-import SimpleITK as sitk
-from pystackreg import StackReg
-import imreg_dft as ird
+
 
 from tardis_em_analysis import version
 from tardis_em_analysis.stitch_volume.utils import sort_tomogram_files
@@ -43,7 +43,7 @@ class AlignTomograms:
         self.output_path = output_path
         self.method = method.lower()
 
-        _valid = ['sift', 'warp', 'powell', 'akaze', 'sitk', 'stackreg', 'logpolar', 'imregdft']
+        _valid = ['sift', 'warp', 'powell', 'akaze']
         assert method in _valid, f'Method must be one of {_valid}, but got {method}'
         assert len(self.images_path) == len(self.coords_path), \
             (f'Image and coord path must have same length! '
@@ -287,12 +287,6 @@ class AlignTomograms:
         self.save_log()
         self.update_progress(i, metric)
 
-        moving_vol = self.moving_data['Image'].shape
-        # self.moving_data['Image'] = self.course_aligner.get_ridge_transform(self.moving_data['Image'])
-        # self.moving_data['Coordinates'] = self.course_aligner.get_ridge_transform_coord(moving_vol,
-        #                                                                                 self.moving_data['Coordinates'],
-        #                                                                                 *self.moving_data['Image'].shape[1:])
-
         # Save tomogram n+1 under the same file format
         self.log_prediction.append("  - Saved aligned moving data:")
         self.save_log()
@@ -378,7 +372,7 @@ class VolumeRidgeRegistration:
             log_=False,
     ):
         method = method.lower()
-        _valid = ['sift', 'warp', 'powell', 'akaze', 'sitk', 'stackreg', 'logpolar', 'imregdft']
+        _valid = ['sift', 'warp', 'powell', 'akaze']
         assert method in _valid, f'Method must be one of {_valid}, but got {method}'
         self.mean_std = MeanStdNormalize()
         self.normalize = RescaleNormalize(clip_range=(.1, 99.9))
@@ -797,22 +791,6 @@ class VolumeRidgeRegistration:
             self.Angle, self.Tx, self.Ty, self.Scale = result.x
             self.Score = result.fun
 
-        elif self.method == 'sitk':
-            self.Angle, self.Tx, self.Ty, self.Scale = self.align_images_sitk(
-                fixed_img, moving_img)
-
-        elif self.method == 'stackreg':
-            self.Angle, self.Tx, self.Ty, self.Scale = self.align_images_stackreg(
-                fixed_img, moving_img)
-
-        elif self.method == 'logpolar':
-            self.Angle, self.Tx, self.Ty, self.Scale = self.align_images_logpolar(
-                fixed_img, moving_img)
-
-        elif self.method == 'imregdft':
-            self.Angle, self.Tx, self.Ty, self.Scale = self.align_images_imregdft(
-                fixed_img, moving_img)
-
         # Scale translations from downscaled projection space to full-resolution
         self.Ty *= self.down_scale
         self.Tx *= self.down_scale
@@ -943,219 +921,6 @@ class VolumeRidgeRegistration:
 
         return angle, tx, ty, scale
 
-    def _crop_to_content(self, fixed_img, moving_img):
-        """Crop both images to the bounding box of their combined content masks.
-
-        The projections are zero-padded for rotation tolerance. This method
-        extracts the content region so registration methods aren't dominated
-        by the identical zero borders.
-
-        Returns (fixed_crop, moving_crop, offset_y, offset_x).
-        """
-        # Union of both masks to get the full content region
-        combined = np.maximum(self.mask_fix, self.mask_moving)
-        rows = np.any(combined, axis=1)
-        cols = np.any(combined, axis=0)
-
-        if not rows.any() or not cols.any():
-            # Fallback: return originals if masks are empty
-            return fixed_img, moving_img, 0, 0
-
-        rmin, rmax = np.where(rows)[0][[0, -1]]
-        cmin, cmax = np.where(cols)[0][[0, -1]]
-
-        fixed_crop = fixed_img[rmin:rmax + 1, cmin:cmax + 1]
-        moving_crop = moving_img[rmin:rmax + 1, cmin:cmax + 1]
-
-        return fixed_crop, moving_crop, rmin, cmin
-
-    @staticmethod
-    def _apply_clahe(img):
-        """Apply CLAHE to a [0,1] float image. Returns float64 in [0,1]."""
-        uint8 = np.clip(img * 255.0, 0, 255).astype(np.uint8)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        return clahe.apply(uint8).astype(np.float64) / 255.0
-
-    def align_images_sitk(self, fixed_img, moving_img):
-        """SimpleITK Similarity2D registration with Mattes MI + multi-resolution."""
-        # Crop to content region to avoid zero-padded borders dominating registration
-        fixed_crop, moving_crop, offset_y, offset_x = self._crop_to_content(fixed_img, moving_img)
-
-        # CLAHE enhances local contrast for better MI gradient signal
-        fixed_f64 = self._apply_clahe(fixed_crop)
-        moving_f64 = self._apply_clahe(moving_crop)
-
-        fixed_sitk = sitk.GetImageFromArray(fixed_f64)
-        moving_sitk = sitk.GetImageFromArray(moving_f64)
-        fixed_sitk = sitk.Cast(fixed_sitk, sitk.sitkFloat64)
-        moving_sitk = sitk.Cast(moving_sitk, sitk.sitkFloat64)
-
-        # MOMENTS aligns centers-of-mass and principal axes → better start than GEOMETRY
-        initial_transform = sitk.CenteredTransformInitializer(
-            fixed_sitk, moving_sitk,
-            sitk.Similarity2DTransform(),
-            sitk.CenteredTransformInitializerFilter.MOMENTS
-        )
-
-        reg = sitk.ImageRegistrationMethod()
-
-        reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
-        reg.SetMetricSamplingStrategy(reg.REGULAR)
-        reg.SetMetricSamplingPercentage(0.5)
-
-        reg.SetInterpolator(sitk.sitkLinear)
-
-        # Deeper pyramid: start very coarse to avoid local minima
-        reg.SetShrinkFactorsPerLevel(shrinkFactors=[8, 4, 2, 1])
-        reg.SetSmoothingSigmasPerLevel(smoothingSigmas=[4.0, 2.0, 1.0, 0.0])
-        reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-
-        # GradientDescentLineSearch: line search finds optimal step automatically,
-        # much more robust than RegularStepGradientDescent which halves step on
-        # direction change and can stall when initial gradient is small.
-        reg.SetOptimizerAsGradientDescentLineSearch(
-            learningRate=1.5,
-            numberOfIterations=500,
-            convergenceMinimumValue=1e-6,
-            convergenceWindowSize=20,
-        )
-        reg.SetOptimizerScalesFromPhysicalShift()
-
-        reg.SetInitialTransform(initial_transform, inPlace=False)
-
-        try:
-            final_transform = reg.Execute(fixed_sitk, moving_sitk)
-        except RuntimeError:
-            return 0.0, 0.0, 0.0, 1.0
-
-        # Extract parameters from Similarity2DTransform
-        if isinstance(final_transform, sitk.CompositeTransform):
-            t = sitk.Similarity2DTransform(final_transform.GetNthTransform(0))
-        else:
-            t = sitk.Similarity2DTransform(final_transform)
-
-        angle = np.rad2deg(t.GetAngle())
-        scale = t.GetScale()
-        # SimpleITK returns (tx, ty) in physical coords (col, row)
-        tx, ty = t.GetTranslation()
-
-        self.Score = reg.GetMetricValue()
-
-        return angle, tx, ty, scale
-
-    def align_images_stackreg(self, fixed_img, moving_img):
-        """pyStackReg SCALED_ROTATION: proven for microscopy stack alignment."""
-        # Crop to content region to avoid zero-padded borders dominating
-        fixed_crop, moving_crop, offset_y, offset_x = self._crop_to_content(fixed_img, moving_img)
-
-        # CLAHE enhances local contrast → better feature detection in TurboReg
-        fixed_enh = self._apply_clahe(fixed_crop)
-        moving_enh = self._apply_clahe(moving_crop)
-
-        sr = StackReg(StackReg.SCALED_ROTATION)
-        tmat = sr.register(fixed_enh, moving_enh)
-
-        # Extract angle, scale, tx, ty from the 3x3 similarity matrix
-        scale = np.sqrt(tmat[0, 0] ** 2 + tmat[1, 0] ** 2)
-        angle = np.arctan2(tmat[1, 0], tmat[0, 0]) * 180.0 / np.pi
-        tx = tmat[0, 2]
-        ty = tmat[1, 2]
-
-        if scale < 0.5 or scale > 2.0:
-            return 0.0, 0.0, 0.0, 1.0
-
-        return angle, tx, ty, scale
-
-    def align_images_logpolar(self, fixed_img, moving_img):
-        """Log-polar + phase correlation: FFT-based rotation+scale+translation recovery."""
-        from skimage.registration import phase_cross_correlation
-        from skimage.transform import warp_polar
-
-        # Crop to content region to avoid zero-padded borders
-        fixed_f, moving_f, offset_y, offset_x = self._crop_to_content(fixed_img, moving_img)
-        fixed_f = fixed_f.astype(np.float64)
-        moving_f = moving_f.astype(np.float64)
-
-        # Apply Hanning window to reduce spectral leakage before FFT
-        h, w = fixed_f.shape
-        window = np.outer(np.hanning(h), np.hanning(w))
-
-        # Step 1: Use magnitude spectrum to decouple translation from rotation/scale
-        f_fixed = np.fft.fftshift(np.abs(np.fft.fft2(fixed_f * window)))
-        f_moving = np.fft.fftshift(np.abs(np.fft.fft2(moving_f * window)))
-
-        # Apply log on magnitude (improves dynamic range)
-        f_fixed = np.log1p(f_fixed)
-        f_moving = np.log1p(f_moving)
-
-        # Step 2: Log-polar transform of magnitude spectra
-        radius = min(f_fixed.shape) // 2
-        lp_fixed = warp_polar(f_fixed, radius=radius, scaling='log', output_shape=(360, radius))
-        lp_moving = warp_polar(f_moving, radius=radius, scaling='log', output_shape=(360, radius))
-
-        # Step 3: Phase correlation on log-polar images → recovers angle and log(scale)
-        shift_lp, _, _ = phase_cross_correlation(
-            lp_fixed, lp_moving, upsample_factor=20, normalization=None
-        )
-
-        angle = -shift_lp[0]  # row = angle (1 row = 1 degree)
-        # Convert log-scale shift to actual scale factor
-        log_base = np.log(radius) / radius
-        scale = np.exp(shift_lp[1] * log_base)
-
-        if scale < 0.5 or scale > 2.0:
-            scale = 1.0
-
-        # Step 4: De-rotate and de-scale the moving image, then find translation
-        from skimage.transform import rotate as sk_rotate, rescale as sk_rescale
-        moving_corrected = sk_rotate(moving_f, angle, resize=False, preserve_range=True)
-        if abs(scale - 1.0) > 0.01:
-            moving_corrected = zoom(moving_corrected, 1.0 / scale)
-            # Pad or crop to match fixed size
-            dy = fixed_f.shape[0] - moving_corrected.shape[0]
-            dx = fixed_f.shape[1] - moving_corrected.shape[1]
-            if dy > 0 or dx > 0:
-                moving_corrected = np.pad(moving_corrected,
-                    ((max(0, dy // 2), max(0, dy - dy // 2)),
-                     (max(0, dx // 2), max(0, dx - dx // 2))),
-                    mode='constant')
-            moving_corrected = moving_corrected[:fixed_f.shape[0], :fixed_f.shape[1]]
-
-        # Apply Hanning window for translation phase correlation too
-        h2, w2 = fixed_f.shape
-        window2 = np.outer(np.hanning(h2), np.hanning(w2))
-        shift_trans, _, _ = phase_cross_correlation(
-            fixed_f * window2, moving_corrected * window2,
-            upsample_factor=20, normalization=None
-        )
-        ty, tx = shift_trans[0], shift_trans[1]
-
-        return angle, tx, ty, scale
-
-    def align_images_imregdft(self, fixed_img, moving_img):
-        """imreg_dft: FFT-based similarity registration (Reddy & Chatterji 1996)."""
-        # Crop to content region to avoid zero-padded borders
-        fixed_crop, moving_crop, offset_y, offset_x = self._crop_to_content(fixed_img, moving_img)
-
-        # CLAHE enhances contrast for better FFT peak detection
-        fixed_f = self._apply_clahe(fixed_crop)
-        moving_f = self._apply_clahe(moving_crop)
-
-        try:
-            result = ird.similarity(fixed_f, moving_f, numiter=5)
-        except Exception:
-            return 0.0, 0.0, 0.0, 1.0
-
-        angle = result['angle']
-        scale = result['scale']
-        ty, tx = result['tvec']  # (row, col) = (ty, tx)
-        self.Score = result.get('success', 0.0)
-
-        if scale < 0.5 or scale > 2.0:
-            return 0.0, 0.0, 0.0, 1.0
-
-        return angle, float(tx), float(ty), scale
-
     def get_transformation_metrics(self):
         return dict(
             zip(
@@ -1228,6 +993,29 @@ class VolumeRidgeRegistration:
             return log_, moving_vol, moving_coord
         else:
             return log_
+
+
+def to_am_stack(temp_files, shapes, pixel_size, filename):
+    """Create AM file for stacked volumes by loading temp files sequentially to reduce RAM usage."""
+    max_y = max(s[1] for s in shapes)
+    max_x = max(s[2] for s in shapes)
+    full_z = sum(s[0] for s in shapes)
+    dtype = np.load(temp_files[0]).dtype
+
+    stitched_vol = np.empty((full_z, max_y, max_x), dtype=dtype)
+    z_offset = 0
+
+    for temp_file, shape in zip(temp_files, shapes):
+        vol = np.load(temp_file)
+        dy = max_y - shape[1]
+        dx = max_x - shape[2]
+        if dy > 0 or dx > 0:
+            vol = np.pad(vol, ((0, 0), (dy // 2, dy - dy // 2), (dx // 2, dx - dx // 2)),
+                         mode='constant', constant_values=0)
+        stitched_vol[z_offset:z_offset + shape[0], :, :] = vol
+        z_offset += shape[0]
+
+    to_am(stitched_vol.astype(np.int8), pixel_size, filename)
 
 
 def stitch_tomogram_stack(
@@ -1321,6 +1109,7 @@ def stitch_tomogram_stack(
     log_lines.append("")
 
     aligner = VolumeRidgeRegistration(method=method, down_scale=down_scale)
+    temp_dir = tempfile.mkdtemp()
 
     # 3. Compute pairwise transforms and accumulate
     pairwise_transforms = []
@@ -1335,6 +1124,8 @@ def stitch_tomogram_stack(
         logger.info(f"Registering pair {i} \u2192 {i + 1} ...")
 
         metric = aligner(volumes[i], volumes[i + 1], return_aligned=False)
+        metric['Tx'] =  metric['Tx'] / 10
+        metric['Ty'] = metric['Ty'] / 10
         pairwise_transforms.append(metric)
 
         accum_angle += metric['Angle']
@@ -1364,8 +1155,9 @@ def stitch_tomogram_stack(
         log_lines.append("")
     log_lines.append("")
 
-    # 4. Transform each volume and spatial graph with its accumulated transform
-    transformed_volumes = []
+    # 4. Transform each volume, save to temp files, and transform coordinates
+    temp_files = []
+    shapes = []
     transformed_coords = []
     save_am_coord = NumpyToAmira()
 
@@ -1381,20 +1173,22 @@ def stitch_tomogram_stack(
         log_lines.append(f"    Ty:     {t['Ty']:.4f}")
         log_lines.append(f"    Scale:  {t['Scale']:.6f}")
 
-        vol = volumes[i]
-
         if i == 0:
-            transformed_volumes.append(vol)
+            vol = volumes[i]
         else:
             aligner.Angle = t['Angle']
             aligner.Tx = t['Tx']
             aligner.Ty = t['Ty']
             aligner.Scale = t['Scale']
 
-            vol_transformed = aligner.get_ridge_transform(vol, reshape=True)
-            transformed_volumes.append(vol_transformed)
+            vol = aligner.get_ridge_transform(volumes[i], reshape=True)
 
-        log_lines.append(f"    Output shape: {transformed_volumes[i].shape}")
+        temp_path = join(temp_dir, f'temp_{i}.npy')
+        np.save(temp_path, vol)
+        shapes.append(vol.shape)
+        temp_files.append(temp_path)
+
+        log_lines.append(f"    Output shape: {vol.shape}")
         log_lines.append("")
 
         # Transform coordinates if available
@@ -1408,45 +1202,43 @@ def stitch_tomogram_stack(
             vol_shape = volumes[i].shape
             coord_transformed = aligner.get_ridge_transform_coord(
                 vol_shape, coord.copy(),
-                *transformed_volumes[i].shape[1:]
+                *vol.shape[1:]
             )
             transformed_coords.append(coord_transformed)
         else:
             transformed_coords.append(coord)
 
-    # 5. Stack volumes — pad Y/X to the max across all transformed volumes
-    max_y = max(v.shape[1] for v in transformed_volumes)
-    max_x = max(v.shape[2] for v in transformed_volumes)
+    # Free memory
+    del volumes
 
-    padded_volumes = []
-    for v in transformed_volumes:
-        dy = max_y - v.shape[1]
-        dx = max_x - v.shape[2]
-        if dy > 0 or dx > 0:
-            v = np.pad(v, ((0, 0), (dy // 2, dy - dy // 2), (dx // 2, dx - dx // 2)),
-                       mode='constant', constant_values=0)
-        padded_volumes.append(v)
-
-    stitched_vol = np.concatenate(padded_volumes, axis=0)
-    logger.info(f"Stitched volume shape: {stitched_vol.shape}")
-
-    # Save stitched volume
+    # 5. Create stitched AM volume from temp files
     px = pixel_sizes[0] if pixel_sizes[0] is not None else 1.0
-    to_am(stitched_vol, px, pjoin(output_dir, 'stitched_volume.am'))
-    logger.info(f"Saved stitched volume to {pjoin(output_dir, 'stitched_volume.am')}")
+    stitched_path = pjoin(output_dir, 'stitched_volume.am')
+    to_am_stack(temp_files, shapes, px, stitched_path)
+    full_z = sum(s[0] for s in shapes)
+    max_y = max(s[1] for s in shapes)
+    max_x = max(s[2] for s in shapes)
+    logger.info(f"Stitched volume shape: {(full_z, max_y, max_x)}")
+    logger.info(f"Saved stitched volume to {stitched_path}")
 
-    # 6. Merge spatial graphs — shift Z and re-number segment IDs
+    # 6. Merge spatial graphs — shift Z, centre XY, and re-number segment IDs
     merged_coords = []
     z_offset = 0
     id_offset = 0
-    for i, (coord, vol) in enumerate(zip(transformed_coords, transformed_volumes)):
+    for i, coord in enumerate(transformed_coords):
         if coord is not None:
             c = coord.copy()
             c[:, 0] += id_offset
+            # Mirror the symmetric padding applied by to_am_stack so that
+            # coordinates stay aligned with the stitched volume canvas.
+            dy = max_y - shapes[i][1]
+            dx = max_x - shapes[i][2]
+            c[:, 1] += dy // 2  # axis-1 (shape[1]) offset
+            c[:, 2] += dx // 2  # axis-2 (shape[2]) offset
             c[:, 3] += z_offset
             merged_coords.append(c)
             id_offset = int(c[:, 0].max()) + 1
-        z_offset += vol.shape[0]
+        z_offset += shapes[i][0]
 
     if merged_coords:
         merged = np.concatenate(merged_coords, axis=0)
@@ -1459,7 +1251,7 @@ def stitch_tomogram_stack(
 
     # 7. Write log file
     log_lines.append("--- Stitched Output ---")
-    log_lines.append(f"  Volume shape: {stitched_vol.shape}  dtype: {stitched_vol.dtype}")
+    log_lines.append(f"  Volume shape: {(full_z, max_y, max_x)}  dtype: int8")
     log_lines.append(f"  Pixel size:   {px}")
     log_lines.append(f"  Volume file:  {pjoin(output_dir, 'stitched_volume.am')}")
     if merged_coords:
@@ -1475,165 +1267,7 @@ def stitch_tomogram_stack(
         f.write("\n".join(log_lines))
     logger.info(f"Saved log to {log_path}")
 
+    # Clean up temp files
+    shutil.rmtree(temp_dir)
+
     return pairwise_transforms
-
-
-def extract_tissue_region(image):
-    """Extract tissue region from image as in Kajihara et al."""
-    # Convert to grayscale using UV component in YUV
-    yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV) if len(image.shape) == 3 else cv2.cvtColor(cv2.cvtColor(image, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2YUV)
-    gray = yuv[:, :, 1]  # U component
-
-    # Binary with Otsu
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Find contours
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return np.ones_like(binary, dtype=np.uint8) * 255
-
-    # Largest contour
-    mask = np.zeros_like(binary)
-    cv2.drawContours(mask, [max(contours, key=cv2.contourArea)], -1, 255, -1)
-
-    return mask
-
-
-def non_rigid_register(source, target, k_max=16):
-    """Implement the non-rigid registration from Kajihara et al. 2019"""
-    # Convert to uint8 if not
-    if source.dtype != np.uint8:
-        source = (np.clip(source, 0, 1) * 255).astype(np.uint8)
-    if target.dtype != np.uint8:
-        target = (np.clip(target, 0, 1) * 255).astype(np.uint8)
-
-    # Convert to grayscale if needed
-    if len(source.shape) == 3:
-        source = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
-    if len(target.shape) == 3:
-        target = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
-
-    # Extract tissue masks
-    mask_source = extract_tissue_region(cv2.cvtColor(source, cv2.COLOR_GRAY2BGR))
-    mask_target = extract_tissue_region(cv2.cvtColor(target, cv2.COLOR_GRAY2BGR))
-
-    # AKAZE
-    akaze = cv2.AKAZE_create()
-    kp_s, des_s = akaze.detectAndCompute(source, mask_source)
-    kp_t, des_t = akaze.detectAndCompute(target, mask_target)
-
-    # Match
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
-    matches = matcher.knnMatch(des_s, des_t, k=2)
-
-    # Ratio test
-    good_matches = []
-    for m, n in matches:
-        if m.distance < 0.75 * n.distance:
-            good_matches.append(m)
-
-    if len(good_matches) < 4:
-        return source  # No registration
-
-    # Points
-    pts_s = np.float32([kp_s[m.queryIdx].pt for m in good_matches])
-    pts_t = np.float32([kp_t[m.trainIdx].pt for m in good_matches])
-
-    # Determine K
-    errors = []
-    for k in range(1, k_max + 1):
-        if len(pts_s) < k:
-            break
-        kmeans = KMeans(n_clusters=k, n_init=10)
-        labels = kmeans.fit_predict(pts_s)
-
-        transforms = []
-        centers = []
-        for i in range(k):
-            cluster_s = pts_s[labels == i]
-            cluster_t = pts_t[labels == i]
-            if len(cluster_s) < 4:
-                continue
-            M, _ = cv2.estimateAffinePartial2D(cluster_s.reshape(-1, 1, 2), cluster_t.reshape(-1, 1, 2), cv2.RANSAC)
-            if M is not None:
-                transforms.append(M)
-                centers.append(np.mean(cluster_s, axis=0))
-
-        if not transforms:
-            errors.append(float('inf'))
-            continue
-
-        # For simplicity, compute average error (not full DCIB)
-        error = 0
-        for ps, pt in zip(pts_s, pts_t):
-            # Find closest center
-            dists = [np.linalg.norm(ps - c) for c in centers]
-            idx = np.argmin(dists)
-            M = transforms[idx]
-            ps_h = np.append(ps, 1)
-            pt_pred = M @ ps_h
-            error += np.linalg.norm(pt - pt_pred[:2])
-        errors.append(error / len(pts_s))
-
-    if not errors:
-        return source
-
-    k_opt = np.argmin(errors) + 1
-
-    # Now with k_opt
-    kmeans = KMeans(n_clusters=k_opt, n_init=10)
-    labels = kmeans.fit_predict(pts_s)
-
-    transforms = []
-    centers = []
-    for i in range(k_opt):
-        cluster_s = pts_s[labels == i]
-        cluster_t = pts_t[labels == i]
-        if len(cluster_s) >= 4:
-            M, _ = cv2.estimateAffinePartial2D(cluster_s.reshape(-1, 1, 2), cluster_t.reshape(-1, 1, 2), cv2.RANSAC)
-            if M is not None:
-                transforms.append(M)
-                centers.append(np.mean(cluster_s, axis=0))
-
-    if not transforms:
-        return source
-
-    # For each pixel, find weights and apply average transform (simplified, not DCIB)
-    h = int(round(float(source.shape[0])))
-    w = int(round(float(source.shape[1])))
-    registered = np.zeros_like(source, dtype=np.float32)
-
-    for y in range(h):
-        for x in range(w):
-            p = np.array([x, y])
-            weights = []
-            Ms = []
-            for c, M in zip(centers, transforms):
-                dist = np.linalg.norm(p - c)
-                if dist == 0:
-                    w = 1
-                else:
-                    w = 1 / dist**2
-                weights.append(w)
-                Ms.append(M)
-            weights = np.array(weights)
-            weights /= weights.sum()
-
-            # Average transform (simplified)
-            M_avg = np.zeros((2, 3))
-            for w, M in zip(weights, Ms):
-                M_avg += w * M
-
-            # Apply
-            p_h = np.append(p, 1)
-            p_new = M_avg @ p_h
-            x_new, y_new = p_new[:2]
-
-            if 0 <= x_new < w and 0 <= y_new < h:
-                registered[y, x] = source[int(y_new), int(x_new)]
-            else:
-                registered[y, x] = 0
-
-    return registered.astype(np.uint8)
-
-
