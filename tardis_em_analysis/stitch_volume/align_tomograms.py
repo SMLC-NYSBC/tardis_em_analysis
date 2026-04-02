@@ -457,11 +457,11 @@ class VolumeRidgeRegistration:
         # 3. Translate
         pad_left = (w_r - w) / 2 + max(0, tx)
         pad_right = (w_r - w) / 2 + max(0, -tx)
-        pad_H = int(max(pad_left, pad_right))
+        pad_H = max(0, int(max(pad_left, pad_right)))
 
         pad_top = (h_r - h) / 2 + max(0, ty)
         pad_bottom = (h_r - h) / 2 + max(0, -ty)
-        pad_W = int(max(pad_top, pad_bottom))
+        pad_W = max(0, int(max(pad_top, pad_bottom)))
 
         if _2d:
             return (pad_H, pad_H), (pad_W, pad_W)

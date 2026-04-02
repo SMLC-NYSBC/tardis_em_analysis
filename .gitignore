@@ -7,3 +7,5 @@
 .DS_Store
 .vscode/settings.json
 /tardis_em_analysis.egg-info
+tardis_em_analysis.code-workspace
+tardis_em_analysis/.DS_Store
